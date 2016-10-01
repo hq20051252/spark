@@ -17,28 +17,30 @@
 
 package org.apache.spark.sql.catalyst.expressions.codegen
 
-import org.apache.spark.Logging
-import org.apache.spark.annotation.Private
-import org.apache.spark.sql.Row
+import java.io.ObjectInputStream
+
+import com.esotericsoftware.kryo.{Kryo, KryoSerializable}
+import com.esotericsoftware.kryo.io.{Input, Output}
+
+import org.apache.spark.internal.Logging
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.types.{BinaryType, NumericType}
+import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.Utils
 
 /**
  * Inherits some default implementation for Java from `Ordering[Row]`
  */
-@Private
-class BaseOrdering extends Ordering[Row] {
-  def compare(a: Row, b: Row): Int = {
+class BaseOrdering extends Ordering[InternalRow] {
+  def compare(a: InternalRow, b: InternalRow): Int = {
     throw new UnsupportedOperationException
   }
 }
 
 /**
- * Generates bytecode for an [[Ordering]] of [[Row Rows]] for a given set of
- * [[Expression Expressions]].
+ * Generates bytecode for an [[Ordering]] of rows for a given set of expressions.
  */
-object GenerateOrdering extends CodeGenerator[Seq[SortOrder], Ordering[Row]] with Logging {
-  import scala.reflect.runtime.universe._
+object GenerateOrdering extends CodeGenerator[Seq[SortOrder], Ordering[InternalRow]] with Logging {
 
   protected def canonicalize(in: Seq[SortOrder]): Seq[SortOrder] =
     in.map(ExpressionCanonicalizer.execute(_).asInstanceOf[SortOrder])
@@ -46,93 +48,152 @@ object GenerateOrdering extends CodeGenerator[Seq[SortOrder], Ordering[Row]] wit
   protected def bind(in: Seq[SortOrder], inputSchema: Seq[Attribute]): Seq[SortOrder] =
     in.map(BindReferences.bindReference(_, inputSchema))
 
-  protected def create(ordering: Seq[SortOrder]): Ordering[Row] = {
-    val a = newTermName("a")
-    val b = newTermName("b")
-    val ctx = newCodeGenContext()
+  /**
+   * Creates a code gen ordering for sorting this schema, in ascending order.
+   */
+  def create(schema: StructType): BaseOrdering = {
+    create(schema.zipWithIndex.map { case (field, ordinal) =>
+      SortOrder(BoundReference(ordinal, field.dataType, nullable = true), Ascending)
+    })
+  }
 
-    val comparisons = ordering.zipWithIndex.map { case (order, i) =>
-      val evalA = expressionEvaluator(order.child, ctx)
-      val evalB = expressionEvaluator(order.child, ctx)
-      val asc = order.direction == Ascending
-      val compare = order.child.dataType match {
-        case BinaryType =>
-          s"""
-            {
-              byte[] x = ${if (asc) evalA.primitiveTerm else evalB.primitiveTerm};
-              byte[] y = ${if (!asc) evalB.primitiveTerm else evalA.primitiveTerm};
-              int j = 0;
-              while (j < x.length && j < y.length) {
-                if (x[j] != y[j]) return x[j] - y[j];
-                j = j + 1;
-              }
-              int d = x.length - y.length;
-              if (d != 0) {
-                return d;
-              }
-            }"""
-        case _: NumericType =>
-          s"""
-            if (${evalA.primitiveTerm} != ${evalB.primitiveTerm}) {
-              if (${evalA.primitiveTerm} > ${evalB.primitiveTerm}) {
-                return ${if (asc) "1" else "-1"};
-              } else {
-                return ${if (asc) "-1" else "1"};
-              }
-            }"""
-        case _ =>
-          s"""
-            int comp = ${evalA.primitiveTerm}.compare(${evalB.primitiveTerm});
+  /**
+   * Generates the code for comparing a struct type according to its natural ordering
+   * (i.e. ascending order by field 1, then field 2, ..., then field n.
+   */
+  def genComparisons(ctx: CodegenContext, schema: StructType): String = {
+    val ordering = schema.fields.map(_.dataType).zipWithIndex.map {
+      case(dt, index) => SortOrder(BoundReference(index, dt, nullable = true), Ascending)
+    }
+    genComparisons(ctx, ordering)
+  }
+
+  /**
+   * Generates the code for ordering based on the given order.
+   */
+  def genComparisons(ctx: CodegenContext, ordering: Seq[SortOrder]): String = {
+    val comparisons = ordering.map { order =>
+      val eval = order.child.genCode(ctx)
+      val asc = order.isAscending
+      val isNullA = ctx.freshName("isNullA")
+      val primitiveA = ctx.freshName("primitiveA")
+      val isNullB = ctx.freshName("isNullB")
+      val primitiveB = ctx.freshName("primitiveB")
+      s"""
+          ${ctx.INPUT_ROW} = a;
+          boolean $isNullA;
+          ${ctx.javaType(order.child.dataType)} $primitiveA;
+          {
+            ${eval.code}
+            $isNullA = ${eval.isNull};
+            $primitiveA = ${eval.value};
+          }
+          ${ctx.INPUT_ROW} = b;
+          boolean $isNullB;
+          ${ctx.javaType(order.child.dataType)} $primitiveB;
+          {
+            ${eval.code}
+            $isNullB = ${eval.isNull};
+            $primitiveB = ${eval.value};
+          }
+          if ($isNullA && $isNullB) {
+            // Nothing
+          } else if ($isNullA) {
+            return ${
+              order.nullOrdering match {
+                case NullsFirst => "-1"
+                case NullsLast => "1"
+              }};
+          } else if ($isNullB) {
+            return ${
+              order.nullOrdering match {
+                case NullsFirst => "1"
+                case NullsLast => "-1"
+              }};
+          } else {
+            int comp = ${ctx.genComp(order.child.dataType, primitiveA, primitiveB)};
             if (comp != 0) {
               return ${if (asc) "comp" else "-comp"};
-            }"""
-      }
-
-      s"""
-          i = $a;
-          ${evalA.code}
-          i = $b;
-          ${evalB.code}
-          if (${evalA.nullTerm} && ${evalB.nullTerm}) {
-            // Nothing
-          } else if (${evalA.nullTerm}) {
-            return ${if (order.direction == Ascending) "-1" else "1"};
-          } else if (${evalB.nullTerm}) {
-            return ${if (order.direction == Ascending) "1" else "-1"};
-          } else {
-            $compare
+            }
           }
       """
     }.mkString("\n")
+    comparisons
+  }
 
-    val code = s"""
-      import org.apache.spark.sql.Row;
-
-      public SpecificOrdering generate($exprType[] expr) {
-        return new SpecificOrdering(expr);
+  protected def create(ordering: Seq[SortOrder]): BaseOrdering = {
+    val ctx = newCodeGenContext()
+    val comparisons = genComparisons(ctx, ordering)
+    val codeBody = s"""
+      public SpecificOrdering generate(Object[] references) {
+        return new SpecificOrdering(references);
       }
 
-      class SpecificOrdering extends ${typeOf[BaseOrdering]} {
+      class SpecificOrdering extends ${classOf[BaseOrdering].getName} {
 
-        private $exprType[] expressions = null;
+        private Object[] references;
+        ${ctx.declareMutableStates()}
+        ${ctx.declareAddedFunctions()}
 
-        public SpecificOrdering($exprType[] expr) {
-          expressions = expr;
+        public SpecificOrdering(Object[] references) {
+          this.references = references;
+          ${ctx.initMutableStates()}
         }
 
-        @Override
-        public int compare(Row a, Row b) {
-          Row i = null;  // Holds current row being evaluated.
+        public int compare(InternalRow a, InternalRow b) {
+          InternalRow ${ctx.INPUT_ROW} = null;  // Holds current row being evaluated.
           $comparisons
           return 0;
         }
       }"""
 
-    logDebug(s"Generated Ordering: $code")
+    val code = CodeFormatter.stripOverlappingComments(
+      new CodeAndComment(codeBody, ctx.getPlaceHolderToComments()))
+    logDebug(s"Generated Ordering by ${ordering.mkString(",")}:\n${CodeFormatter.format(code)}")
 
-    val c = compile(code)
-    // fetch the only one method `generate(Expression[])`
-    val m = c.getDeclaredMethods()(0)
-    m.invoke(c.newInstance(), ctx.references.toArray).asInstanceOf[BaseOrdering]
+    CodeGenerator.compile(code).generate(ctx.references.toArray).asInstanceOf[BaseOrdering]
+  }
+}
+
+/**
+ * A lazily generated row ordering comparator.
+ */
+class LazilyGeneratedOrdering(val ordering: Seq[SortOrder])
+  extends Ordering[InternalRow] with KryoSerializable {
+
+  def this(ordering: Seq[SortOrder], inputSchema: Seq[Attribute]) =
+    this(ordering.map(BindReferences.bindReference(_, inputSchema)))
+
+  @transient
+  private[this] var generatedOrdering = GenerateOrdering.generate(ordering)
+
+  def compare(a: InternalRow, b: InternalRow): Int = {
+    generatedOrdering.compare(a, b)
+  }
+
+  private def readObject(in: ObjectInputStream): Unit = Utils.tryOrIOException {
+    in.defaultReadObject()
+    generatedOrdering = GenerateOrdering.generate(ordering)
+  }
+
+  override def write(kryo: Kryo, out: Output): Unit = Utils.tryOrIOException {
+    kryo.writeObject(out, ordering.toArray)
+  }
+
+  override def read(kryo: Kryo, in: Input): Unit = Utils.tryOrIOException {
+    generatedOrdering = GenerateOrdering.generate(kryo.readObject(in, classOf[Array[SortOrder]]))
+  }
+}
+
+object LazilyGeneratedOrdering {
+
+  /**
+   * Creates a [[LazilyGeneratedOrdering]] for the given schema, in natural ascending order.
+   */
+  def forSchema(schema: StructType): LazilyGeneratedOrdering = {
+    new LazilyGeneratedOrdering(schema.zipWithIndex.map {
+      case (field, ordinal) =>
+        SortOrder(BoundReference(ordinal, field.dataType, nullable = true), Ascending)
+    })
   }
 }

@@ -20,9 +20,12 @@ package org.apache.spark
 import scala.collection.mutable
 
 import org.scalatest.{BeforeAndAfter, PrivateMethodTester}
+
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.scheduler._
+import org.apache.spark.scheduler.ExternalClusterManager
 import org.apache.spark.scheduler.cluster.ExecutorInfo
+import org.apache.spark.scheduler.local.LocalSchedulerBackend
 import org.apache.spark.util.ManualClock
 
 /**
@@ -48,7 +51,7 @@ class ExecutorAllocationManagerSuite
 
   test("verify min/max executors") {
     val conf = new SparkConf()
-      .setMaster("local")
+      .setMaster("myDummyLocalExternalClusterManager")
       .setAppName("test-executor-allocation-manager")
       .set("spark.dynamicAllocation.enabled", "true")
       .set("spark.dynamicAllocation.testing", "true")
@@ -90,7 +93,7 @@ class ExecutorAllocationManagerSuite
   }
 
   test("add executors") {
-    sc = createSparkContext(1, 10)
+    sc = createSparkContext(1, 10, 1)
     val manager = sc.executorAllocationManager.get
     sc.listenerBus.postToAll(SparkListenerStageSubmitted(createStageInfo(0, 1000)))
 
@@ -135,7 +138,7 @@ class ExecutorAllocationManagerSuite
   }
 
   test("add executors capped by num pending tasks") {
-    sc = createSparkContext(0, 10)
+    sc = createSparkContext(0, 10, 0)
     val manager = sc.executorAllocationManager.get
     sc.listenerBus.postToAll(SparkListenerStageSubmitted(createStageInfo(0, 5)))
 
@@ -186,7 +189,7 @@ class ExecutorAllocationManagerSuite
   }
 
   test("cancel pending executors when no longer needed") {
-    sc = createSparkContext(0, 10)
+    sc = createSparkContext(0, 10, 0)
     val manager = sc.executorAllocationManager.get
     sc.listenerBus.postToAll(SparkListenerStageSubmitted(createStageInfo(2, 5)))
 
@@ -206,14 +209,14 @@ class ExecutorAllocationManagerSuite
 
     val task2Info = createTaskInfo(1, 0, "executor-1")
     sc.listenerBus.postToAll(SparkListenerTaskStart(2, 0, task2Info))
-    sc.listenerBus.postToAll(SparkListenerTaskEnd(2, 0, null, null, task1Info, null))
-    sc.listenerBus.postToAll(SparkListenerTaskEnd(2, 0, null, null, task2Info, null))
+    sc.listenerBus.postToAll(SparkListenerTaskEnd(2, 0, null, Success, task1Info, null))
+    sc.listenerBus.postToAll(SparkListenerTaskEnd(2, 0, null, Success, task2Info, null))
 
     assert(adjustRequestedExecutors(manager) === -1)
   }
 
   test("remove executors") {
-    sc = createSparkContext(5, 10)
+    sc = createSparkContext(5, 10, 5)
     val manager = sc.executorAllocationManager.get
     (1 to 10).map(_.toString).foreach { id => onExecutorAdded(manager, id) }
 
@@ -262,8 +265,57 @@ class ExecutorAllocationManagerSuite
     assert(executorsPendingToRemove(manager).isEmpty)
   }
 
+  test("remove multiple executors") {
+    sc = createSparkContext(5, 10, 5)
+    val manager = sc.executorAllocationManager.get
+    (1 to 10).map(_.toString).foreach { id => onExecutorAdded(manager, id) }
+
+    // Keep removing until the limit is reached
+    assert(executorsPendingToRemove(manager).isEmpty)
+    assert(removeExecutors(manager, Seq("1")) === Seq("1"))
+    assert(executorsPendingToRemove(manager).size === 1)
+    assert(executorsPendingToRemove(manager).contains("1"))
+    assert(removeExecutors(manager, Seq("2", "3")) === Seq("2", "3"))
+    assert(executorsPendingToRemove(manager).size === 3)
+    assert(executorsPendingToRemove(manager).contains("2"))
+    assert(executorsPendingToRemove(manager).contains("3"))
+    assert(!removeExecutor(manager, "100")) // remove non-existent executors
+    assert(removeExecutors(manager, Seq("101", "102")) !== Seq("101", "102"))
+    assert(executorsPendingToRemove(manager).size === 3)
+    assert(removeExecutor(manager, "4"))
+    assert(removeExecutors(manager, Seq("5")) === Seq("5"))
+    assert(!removeExecutor(manager, "6")) // reached the limit of 5
+    assert(executorsPendingToRemove(manager).size === 5)
+    assert(executorsPendingToRemove(manager).contains("4"))
+    assert(executorsPendingToRemove(manager).contains("5"))
+    assert(!executorsPendingToRemove(manager).contains("6"))
+
+    // Kill executors previously requested to remove
+    onExecutorRemoved(manager, "1")
+    assert(executorsPendingToRemove(manager).size === 4)
+    assert(!executorsPendingToRemove(manager).contains("1"))
+    onExecutorRemoved(manager, "2")
+    onExecutorRemoved(manager, "3")
+    assert(executorsPendingToRemove(manager).size === 2)
+    assert(!executorsPendingToRemove(manager).contains("2"))
+    assert(!executorsPendingToRemove(manager).contains("3"))
+    onExecutorRemoved(manager, "2") // duplicates should not count
+    onExecutorRemoved(manager, "3")
+    assert(executorsPendingToRemove(manager).size === 2)
+    onExecutorRemoved(manager, "4")
+    onExecutorRemoved(manager, "5")
+    assert(executorsPendingToRemove(manager).isEmpty)
+
+    // Try removing again
+    // This should still fail because the number pending + running is still at the limit
+    assert(!removeExecutor(manager, "7"))
+    assert(executorsPendingToRemove(manager).isEmpty)
+    assert(removeExecutors(manager, Seq("8")) !== Seq("8"))
+    assert(executorsPendingToRemove(manager).isEmpty)
+  }
+
   test ("interleaving add and remove") {
-    sc = createSparkContext(5, 10)
+    sc = createSparkContext(5, 10, 5)
     val manager = sc.executorAllocationManager.get
     sc.listenerBus.postToAll(SparkListenerStageSubmitted(createStageInfo(0, 1000)))
 
@@ -282,8 +334,7 @@ class ExecutorAllocationManagerSuite
 
     // Remove until limit
     assert(removeExecutor(manager, "1"))
-    assert(removeExecutor(manager, "2"))
-    assert(removeExecutor(manager, "3"))
+    assert(removeExecutors(manager, Seq("2", "3")) === Seq("2", "3"))
     assert(!removeExecutor(manager, "4")) // lower limit reached
     assert(!removeExecutor(manager, "5"))
     onExecutorRemoved(manager, "1")
@@ -295,7 +346,7 @@ class ExecutorAllocationManagerSuite
     assert(addExecutors(manager) === 2) // upper limit reached
     assert(addExecutors(manager) === 0)
     assert(!removeExecutor(manager, "4")) // still at lower limit
-    assert(!removeExecutor(manager, "5"))
+    assert((manager, Seq("5")) !== Seq("5"))
     onExecutorAdded(manager, "9")
     onExecutorAdded(manager, "10")
     onExecutorAdded(manager, "11")
@@ -304,9 +355,7 @@ class ExecutorAllocationManagerSuite
     assert(executorIds(manager).size === 10)
 
     // Remove succeeds again, now that we are no longer at the lower limit
-    assert(removeExecutor(manager, "4"))
-    assert(removeExecutor(manager, "5"))
-    assert(removeExecutor(manager, "6"))
+    assert(removeExecutors(manager, Seq("4", "5", "6")) === Seq("4", "5", "6"))
     assert(removeExecutor(manager, "7"))
     assert(executorIds(manager).size === 10)
     assert(addExecutors(manager) === 0)
@@ -331,7 +380,7 @@ class ExecutorAllocationManagerSuite
   }
 
   test("starting/canceling add timer") {
-    sc = createSparkContext(2, 10)
+    sc = createSparkContext(2, 10, 2)
     val clock = new ManualClock(8888L)
     val manager = sc.executorAllocationManager.get
     manager.setClock(clock)
@@ -363,7 +412,7 @@ class ExecutorAllocationManagerSuite
   }
 
   test("starting/canceling remove timers") {
-    sc = createSparkContext(2, 10)
+    sc = createSparkContext(2, 10, 2)
     val clock = new ManualClock(14444L)
     val manager = sc.executorAllocationManager.get
     manager.setClock(clock)
@@ -410,7 +459,7 @@ class ExecutorAllocationManagerSuite
   }
 
   test("mock polling loop with no events") {
-    sc = createSparkContext(0, 20)
+    sc = createSparkContext(0, 20, 0)
     val manager = sc.executorAllocationManager.get
     val clock = new ManualClock(2020L)
     manager.setClock(clock)
@@ -436,7 +485,7 @@ class ExecutorAllocationManagerSuite
   }
 
   test("mock polling loop add behavior") {
-    sc = createSparkContext(0, 20)
+    sc = createSparkContext(0, 20, 0)
     val clock = new ManualClock(2020L)
     val manager = sc.executorAllocationManager.get
     manager.setClock(clock)
@@ -486,7 +535,7 @@ class ExecutorAllocationManagerSuite
   }
 
   test("mock polling loop remove behavior") {
-    sc = createSparkContext(1, 20)
+    sc = createSparkContext(1, 20, 1)
     val clock = new ManualClock(2020L)
     val manager = sc.executorAllocationManager.get
     manager.setClock(clock)
@@ -547,7 +596,7 @@ class ExecutorAllocationManagerSuite
   }
 
   test("listeners trigger add executors correctly") {
-    sc = createSparkContext(2, 10)
+    sc = createSparkContext(2, 10, 2)
     val manager = sc.executorAllocationManager.get
     assert(addTime(manager) === NOT_SET)
 
@@ -577,7 +626,7 @@ class ExecutorAllocationManagerSuite
   }
 
   test("listeners trigger remove executors correctly") {
-    sc = createSparkContext(2, 10)
+    sc = createSparkContext(2, 10, 2)
     val manager = sc.executorAllocationManager.get
     assert(removeTimes(manager).isEmpty)
 
@@ -608,7 +657,7 @@ class ExecutorAllocationManagerSuite
   }
 
   test("listeners trigger add and remove executor callbacks correctly") {
-    sc = createSparkContext(2, 10)
+    sc = createSparkContext(2, 10, 2)
     val manager = sc.executorAllocationManager.get
     assert(executorIds(manager).isEmpty)
     assert(removeTimes(manager).isEmpty)
@@ -641,7 +690,7 @@ class ExecutorAllocationManagerSuite
   }
 
   test("SPARK-4951: call onTaskStart before onBlockManagerAdded") {
-    sc = createSparkContext(2, 10)
+    sc = createSparkContext(2, 10, 2)
     val manager = sc.executorAllocationManager.get
     assert(executorIds(manager).isEmpty)
     assert(removeTimes(manager).isEmpty)
@@ -677,7 +726,7 @@ class ExecutorAllocationManagerSuite
   }
 
   test("avoid ramp up when target < running executors") {
-    sc = createSparkContext(0, 100000)
+    sc = createSparkContext(0, 100000, 0)
     val manager = sc.executorAllocationManager.get
     val stage1 = createStageInfo(0, 1000)
     sc.listenerBus.postToAll(SparkListenerStageSubmitted(stage1))
@@ -701,13 +750,205 @@ class ExecutorAllocationManagerSuite
     assert(numExecutorsTarget(manager) === 16)
   }
 
-  private def createSparkContext(minExecutors: Int = 1, maxExecutors: Int = 5): SparkContext = {
+  test("avoid ramp down initial executors until first job is submitted") {
+    sc = createSparkContext(2, 5, 3)
+    val manager = sc.executorAllocationManager.get
+    val clock = new ManualClock(10000L)
+    manager.setClock(clock)
+
+    // Verify the initial number of executors
+    assert(numExecutorsTarget(manager) === 3)
+    schedule(manager)
+    // Verify whether the initial number of executors is kept with no pending tasks
+    assert(numExecutorsTarget(manager) === 3)
+
+    sc.listenerBus.postToAll(SparkListenerStageSubmitted(createStageInfo(1, 2)))
+    clock.advance(100L)
+
+    assert(maxNumExecutorsNeeded(manager) === 2)
+    schedule(manager)
+
+    // Verify that current number of executors should be ramp down when first job is submitted
+    assert(numExecutorsTarget(manager) === 2)
+  }
+
+  test("avoid ramp down initial executors until idle executor is timeout") {
+    sc = createSparkContext(2, 5, 3)
+    val manager = sc.executorAllocationManager.get
+    val clock = new ManualClock(10000L)
+    manager.setClock(clock)
+
+    // Verify the initial number of executors
+    assert(numExecutorsTarget(manager) === 3)
+    schedule(manager)
+    // Verify the initial number of executors is kept when no pending tasks
+    assert(numExecutorsTarget(manager) === 3)
+    (0 until 3).foreach { i =>
+      onExecutorAdded(manager, s"executor-$i")
+    }
+
+    clock.advance(executorIdleTimeout * 1000)
+
+    assert(maxNumExecutorsNeeded(manager) === 0)
+    schedule(manager)
+    // Verify executor is timeout but numExecutorsTarget is not recalculated
+    assert(numExecutorsTarget(manager) === 3)
+
+    // Schedule again to recalculate the numExecutorsTarget after executor is timeout
+    schedule(manager)
+    // Verify that current number of executors should be ramp down when executor is timeout
+    assert(numExecutorsTarget(manager) === 2)
+  }
+
+  test("get pending task number and related locality preference") {
+    sc = createSparkContext(2, 5, 3)
+    val manager = sc.executorAllocationManager.get
+
+    val localityPreferences1 = Seq(
+      Seq(TaskLocation("host1"), TaskLocation("host2"), TaskLocation("host3")),
+      Seq(TaskLocation("host1"), TaskLocation("host2"), TaskLocation("host4")),
+      Seq(TaskLocation("host2"), TaskLocation("host3"), TaskLocation("host4")),
+      Seq.empty,
+      Seq.empty
+    )
+    val stageInfo1 = createStageInfo(1, 5, localityPreferences1)
+    sc.listenerBus.postToAll(SparkListenerStageSubmitted(stageInfo1))
+
+    assert(localityAwareTasks(manager) === 3)
+    assert(hostToLocalTaskCount(manager) ===
+      Map("host1" -> 2, "host2" -> 3, "host3" -> 2, "host4" -> 2))
+
+    val localityPreferences2 = Seq(
+      Seq(TaskLocation("host2"), TaskLocation("host3"), TaskLocation("host5")),
+      Seq(TaskLocation("host3"), TaskLocation("host4"), TaskLocation("host5")),
+      Seq.empty
+    )
+    val stageInfo2 = createStageInfo(2, 3, localityPreferences2)
+    sc.listenerBus.postToAll(SparkListenerStageSubmitted(stageInfo2))
+
+    assert(localityAwareTasks(manager) === 5)
+    assert(hostToLocalTaskCount(manager) ===
+      Map("host1" -> 2, "host2" -> 4, "host3" -> 4, "host4" -> 3, "host5" -> 2))
+
+    sc.listenerBus.postToAll(SparkListenerStageCompleted(stageInfo1))
+    assert(localityAwareTasks(manager) === 2)
+    assert(hostToLocalTaskCount(manager) ===
+      Map("host2" -> 1, "host3" -> 2, "host4" -> 1, "host5" -> 2))
+  }
+
+  test("SPARK-8366: maxNumExecutorsNeeded should properly handle failed tasks") {
+    sc = createSparkContext()
+    val manager = sc.executorAllocationManager.get
+    assert(maxNumExecutorsNeeded(manager) === 0)
+
+    sc.listenerBus.postToAll(SparkListenerStageSubmitted(createStageInfo(0, 1)))
+    assert(maxNumExecutorsNeeded(manager) === 1)
+
+    val taskInfo = createTaskInfo(1, 1, "executor-1")
+    sc.listenerBus.postToAll(SparkListenerTaskStart(0, 0, taskInfo))
+    assert(maxNumExecutorsNeeded(manager) === 1)
+
+    // If the task is failed, we expect it to be resubmitted later.
+    val taskEndReason = ExceptionFailure(null, null, null, null, None)
+    sc.listenerBus.postToAll(SparkListenerTaskEnd(0, 0, null, taskEndReason, taskInfo, null))
+    assert(maxNumExecutorsNeeded(manager) === 1)
+  }
+
+  test("reset the state of allocation manager") {
+    sc = createSparkContext()
+    val manager = sc.executorAllocationManager.get
+    assert(numExecutorsTarget(manager) === 1)
+    assert(numExecutorsToAdd(manager) === 1)
+
+    // Allocation manager is reset when adding executor requests are sent without reporting back
+    // executor added.
+    sc.listenerBus.postToAll(SparkListenerStageSubmitted(createStageInfo(0, 10)))
+
+    assert(addExecutors(manager) === 1)
+    assert(numExecutorsTarget(manager) === 2)
+    assert(addExecutors(manager) === 2)
+    assert(numExecutorsTarget(manager) === 4)
+    assert(addExecutors(manager) === 1)
+    assert(numExecutorsTarget(manager) === 5)
+
+    manager.reset()
+    assert(numExecutorsTarget(manager) === 1)
+    assert(numExecutorsToAdd(manager) === 1)
+    assert(executorIds(manager) === Set.empty)
+
+    // Allocation manager is reset when executors are added.
+    sc.listenerBus.postToAll(SparkListenerStageSubmitted(createStageInfo(0, 10)))
+
+    addExecutors(manager)
+    addExecutors(manager)
+    addExecutors(manager)
+    assert(numExecutorsTarget(manager) === 5)
+
+    onExecutorAdded(manager, "first")
+    onExecutorAdded(manager, "second")
+    onExecutorAdded(manager, "third")
+    onExecutorAdded(manager, "fourth")
+    onExecutorAdded(manager, "fifth")
+    assert(executorIds(manager) === Set("first", "second", "third", "fourth", "fifth"))
+
+    // Cluster manager lost will make all the live executors lost, so here simulate this behavior
+    onExecutorRemoved(manager, "first")
+    onExecutorRemoved(manager, "second")
+    onExecutorRemoved(manager, "third")
+    onExecutorRemoved(manager, "fourth")
+    onExecutorRemoved(manager, "fifth")
+
+    manager.reset()
+    assert(numExecutorsTarget(manager) === 1)
+    assert(numExecutorsToAdd(manager) === 1)
+    assert(executorIds(manager) === Set.empty)
+    assert(removeTimes(manager) === Map.empty)
+
+    // Allocation manager is reset when executors are pending to remove
+    addExecutors(manager)
+    addExecutors(manager)
+    addExecutors(manager)
+    assert(numExecutorsTarget(manager) === 5)
+
+    onExecutorAdded(manager, "first")
+    onExecutorAdded(manager, "second")
+    onExecutorAdded(manager, "third")
+    onExecutorAdded(manager, "fourth")
+    onExecutorAdded(manager, "fifth")
+    assert(executorIds(manager) === Set("first", "second", "third", "fourth", "fifth"))
+
+    removeExecutor(manager, "first")
+    removeExecutors(manager, Seq("second", "third"))
+    assert(executorsPendingToRemove(manager) === Set("first", "second", "third"))
+    assert(executorIds(manager) === Set("first", "second", "third", "fourth", "fifth"))
+
+
+    // Cluster manager lost will make all the live executors lost, so here simulate this behavior
+    onExecutorRemoved(manager, "first")
+    onExecutorRemoved(manager, "second")
+    onExecutorRemoved(manager, "third")
+    onExecutorRemoved(manager, "fourth")
+    onExecutorRemoved(manager, "fifth")
+
+    manager.reset()
+
+    assert(numExecutorsTarget(manager) === 1)
+    assert(numExecutorsToAdd(manager) === 1)
+    assert(executorsPendingToRemove(manager) === Set.empty)
+    assert(removeTimes(manager) === Map.empty)
+  }
+
+  private def createSparkContext(
+      minExecutors: Int = 1,
+      maxExecutors: Int = 5,
+      initialExecutors: Int = 1): SparkContext = {
     val conf = new SparkConf()
-      .setMaster("local")
+      .setMaster("myDummyLocalExternalClusterManager")
       .setAppName("test-executor-allocation-manager")
       .set("spark.dynamicAllocation.enabled", "true")
       .set("spark.dynamicAllocation.minExecutors", minExecutors.toString)
       .set("spark.dynamicAllocation.maxExecutors", maxExecutors.toString)
+      .set("spark.dynamicAllocation.initialExecutors", initialExecutors.toString)
       .set("spark.dynamicAllocation.schedulerBacklogTimeout",
           s"${schedulerBacklogTimeout.toString}s")
       .set("spark.dynamicAllocation.sustainedSchedulerBacklogTimeout",
@@ -730,8 +971,13 @@ private object ExecutorAllocationManagerSuite extends PrivateMethodTester {
   private val sustainedSchedulerBacklogTimeout = 2L
   private val executorIdleTimeout = 3L
 
-  private def createStageInfo(stageId: Int, numTasks: Int): StageInfo = {
-    new StageInfo(stageId, 0, "name", numTasks, Seq.empty, Seq.empty, "no details")
+  private def createStageInfo(
+      stageId: Int,
+      numTasks: Int,
+      taskLocalityPreferences: Seq[Seq[TaskLocation]] = Seq.empty
+    ): StageInfo = {
+    new StageInfo(stageId, 0, "name", numTasks, Seq.empty, Seq.empty, "no details",
+      taskLocalityPreferences = taskLocalityPreferences)
   }
 
   private def createTaskInfo(taskId: Int, taskIndex: Int, executorId: String): TaskInfo = {
@@ -755,12 +1001,15 @@ private object ExecutorAllocationManagerSuite extends PrivateMethodTester {
   private val _updateAndSyncNumExecutorsTarget =
     PrivateMethod[Int]('updateAndSyncNumExecutorsTarget)
   private val _removeExecutor = PrivateMethod[Boolean]('removeExecutor)
+  private val _removeExecutors = PrivateMethod[Seq[String]]('removeExecutors)
   private val _onExecutorAdded = PrivateMethod[Unit]('onExecutorAdded)
   private val _onExecutorRemoved = PrivateMethod[Unit]('onExecutorRemoved)
   private val _onSchedulerBacklogged = PrivateMethod[Unit]('onSchedulerBacklogged)
   private val _onSchedulerQueueEmpty = PrivateMethod[Unit]('onSchedulerQueueEmpty)
   private val _onExecutorIdle = PrivateMethod[Unit]('onExecutorIdle)
   private val _onExecutorBusy = PrivateMethod[Unit]('onExecutorBusy)
+  private val _localityAwareTasks = PrivateMethod[Int]('localityAwareTasks)
+  private val _hostToLocalTaskCount = PrivateMethod[Map[String, Int]]('hostToLocalTaskCount)
 
   private def numExecutorsToAdd(manager: ExecutorAllocationManager): Int = {
     manager invokePrivate _numExecutorsToAdd()
@@ -791,6 +1040,10 @@ private object ExecutorAllocationManagerSuite extends PrivateMethodTester {
     manager invokePrivate _schedule()
   }
 
+  private def maxNumExecutorsNeeded(manager: ExecutorAllocationManager): Int = {
+    manager invokePrivate _maxNumExecutorsNeeded()
+  }
+
   private def addExecutors(manager: ExecutorAllocationManager): Int = {
     val maxNumExecutorsNeeded = manager invokePrivate _maxNumExecutorsNeeded()
     manager invokePrivate _addExecutors(maxNumExecutorsNeeded)
@@ -802,6 +1055,10 @@ private object ExecutorAllocationManagerSuite extends PrivateMethodTester {
 
   private def removeExecutor(manager: ExecutorAllocationManager, id: String): Boolean = {
     manager invokePrivate _removeExecutor(id)
+  }
+
+  private def removeExecutors(manager: ExecutorAllocationManager, ids: Seq[String]): Seq[String] = {
+    manager invokePrivate _removeExecutors(ids)
   }
 
   private def onExecutorAdded(manager: ExecutorAllocationManager, id: String): Unit = {
@@ -827,4 +1084,74 @@ private object ExecutorAllocationManagerSuite extends PrivateMethodTester {
   private def onExecutorBusy(manager: ExecutorAllocationManager, id: String): Unit = {
     manager invokePrivate _onExecutorBusy(id)
   }
+
+  private def localityAwareTasks(manager: ExecutorAllocationManager): Int = {
+    manager invokePrivate _localityAwareTasks()
+  }
+
+  private def hostToLocalTaskCount(manager: ExecutorAllocationManager): Map[String, Int] = {
+    manager invokePrivate _hostToLocalTaskCount()
+  }
+}
+
+/**
+ * A cluster manager which wraps around the scheduler and backend for local mode. It is used for
+ * testing the dynamic allocation policy.
+ */
+private class DummyLocalExternalClusterManager extends ExternalClusterManager {
+
+  def canCreate(masterURL: String): Boolean = masterURL == "myDummyLocalExternalClusterManager"
+
+  override def createTaskScheduler(
+      sc: SparkContext,
+      masterURL: String): TaskScheduler = new TaskSchedulerImpl(sc, 1, isLocal = true)
+
+  override def createSchedulerBackend(
+      sc: SparkContext,
+      masterURL: String,
+      scheduler: TaskScheduler): SchedulerBackend = {
+    val sb = new LocalSchedulerBackend(sc.getConf, scheduler.asInstanceOf[TaskSchedulerImpl], 1)
+    new DummyLocalSchedulerBackend(sc, sb)
+  }
+
+  override def initialize(scheduler: TaskScheduler, backend: SchedulerBackend): Unit = {
+    val sc = scheduler.asInstanceOf[TaskSchedulerImpl]
+    sc.initialize(backend)
+  }
+}
+
+/**
+ * A scheduler backend which wraps around local scheduler backend and exposes the executor
+ * allocation client interface for testing dynamic allocation.
+ */
+private class DummyLocalSchedulerBackend (sc: SparkContext, sb: SchedulerBackend)
+  extends SchedulerBackend with ExecutorAllocationClient {
+
+  override private[spark] def getExecutorIds(): Seq[String] = sc.getExecutorIds()
+
+  override private[spark] def requestTotalExecutors(
+      numExecutors: Int,
+      localityAwareTasks: Int,
+      hostToLocalTaskCount: Map[String, Int]): Boolean =
+    sc.requestTotalExecutors(numExecutors, localityAwareTasks, hostToLocalTaskCount)
+
+  override def requestExecutors(numAdditionalExecutors: Int): Boolean =
+    sc.requestExecutors(numAdditionalExecutors)
+
+  override def killExecutors(executorIds: Seq[String]): Seq[String] = {
+    val response = sc.killExecutors(executorIds)
+    if (response) {
+      executorIds
+    } else {
+      Seq.empty[String]
+    }
+  }
+
+  override def start(): Unit = sb.start()
+
+  override def stop(): Unit = sb.stop()
+
+  override def reviveOffers(): Unit = sb.reviveOffers()
+
+  override def defaultParallelism(): Int = sb.defaultParallelism()
 }

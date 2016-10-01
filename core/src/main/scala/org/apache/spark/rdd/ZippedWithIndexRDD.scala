@@ -37,21 +37,20 @@ class ZippedWithIndexRDDPartition(val prev: Partition, val startIndex: Long)
  * @tparam T parent RDD item type
  */
 private[spark]
-class ZippedWithIndexRDD[T: ClassTag](@transient prev: RDD[T]) extends RDD[(T, Long)](prev) {
+class ZippedWithIndexRDD[T: ClassTag](prev: RDD[T]) extends RDD[(T, Long)](prev) {
 
   /** The start index of each partition. */
   @transient private val startIndices: Array[Long] = {
     val n = prev.partitions.length
     if (n == 0) {
-      Array[Long]()
+      Array.empty
     } else if (n == 1) {
       Array(0L)
     } else {
       prev.context.runJob(
         prev,
         Utils.getIteratorSize _,
-        0 until n - 1, // do not need to count the last partition
-        allowLocal = false
+        0 until n - 1 // do not need to count the last partition
       ).scanLeft(0L)(_ + _)
     }
   }
